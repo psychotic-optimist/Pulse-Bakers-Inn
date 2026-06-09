@@ -566,8 +566,17 @@ def _render_loading_session_tab(orders: list[dict]) -> None:
 def render_loading_plan(orders: list[dict], dispatch_date: date) -> None:
     """
     Interactive loading plan for Freighter (depot) trucks only.
-    Each row has a checkbox; ticking it sets loaded_qty = target_qty.
-    After ticking, a popover button allows fine‑tuning the actual quantity.
+
+    Columns mirror the spreadsheet template shown in the UI spec:
+      ✓ | ROUTE | ORDER (target) | DRIVER | TRUCK | BREAD QTY | CONFECT QTY | STATUS | ⚙ Adjust
+
+    Ticking a checkbox marks the truck as fully loaded (loaded_qty = target_qty).
+    The Adjust popover allows the supervisor to fine-tune the actual quantity.
+
+    NOTE: CONFECT QTY is shown as a read-only placeholder column.  The current
+    schema stores a single target_qty (bread total).  If separate bread/confect
+    quantities are required in future a schema migration adding bread_target_qty
+    and confect_target_qty will be needed — raise this with the database admin.
     """
     if not auth.can_edit():
         return
@@ -578,59 +587,92 @@ def render_loading_plan(orders: list[dict], dispatch_date: date) -> None:
         return
 
     st.markdown(
-        "<small style='color:#6b7280'>Tick a truck to mark it fully loaded. "
-        "You can then adjust the actual quantity loaded via the 'Adjust' button.</small>",
+        "<small style='color:#6b7280'>"
+        "Tick a truck to mark it <b>fully loaded</b>. "
+        "Use <b>⚙ Adjust</b> to correct the actual quantity loaded. "
+        "<em>CONFECT QTY column is reserved — separate confect quantities require a schema migration.</em>"
+        "</small>",
         unsafe_allow_html=True,
     )
     st.markdown("")
 
-    # Initialise per‑order adjustment state
+    # Column header row (static HTML for visual alignment)
+    st.markdown(
+        "<div style='display:grid;"
+        "grid-template-columns:2.2rem 2fr 1fr 2fr 1.5fr 1.2fr 1.2fr 2fr 1.8fr 1fr;"
+        "gap:0 0.5rem;padding:0 0.25rem;"
+        "background:#1B2D6B;border-radius:6px 6px 0 0;margin-bottom:2px;'>"
+        "<span style='color:#C9A84C;font-weight:700;font-size:0.82em;padding:8px 4px;'></span>"
+        "<span style='color:#C9A84C;font-weight:700;font-size:0.82em;padding:8px 4px;'>ROUTE</span>"
+        "<span style='color:#C9A84C;font-weight:700;font-size:0.82em;padding:8px 4px;text-align:right'>ORDER</span>"
+        "<span style='color:#C9A84C;font-weight:700;font-size:0.82em;padding:8px 4px;'>DRIVER</span>"
+        "<span style='color:#C9A84C;font-weight:700;font-size:0.82em;padding:8px 4px;'>TRUCK</span>"
+        "<span style='color:#C9A84C;font-weight:700;font-size:0.82em;padding:8px 4px;text-align:right'>BREAD QTY</span>"
+        "<span style='color:#C9A84C;font-weight:700;font-size:0.82em;padding:8px 4px;text-align:right'>CONFECT QTY</span>"
+        "<span style='color:#C9A84C;font-weight:700;font-size:0.82em;padding:8px 4px;'>PROGRESS</span>"
+        "<span style='color:#C9A84C;font-weight:700;font-size:0.82em;padding:8px 4px;'>STATUS</span>"
+        "<span style='color:#C9A84C;font-weight:700;font-size:0.82em;padding:8px 4px;'></span>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    # Initialise per-order state
     for o in freighter_orders:
         oid = o["id"]
         _ss_get(f"lp_checked_{oid}", o.get("loaded_qty", 0) >= o.get("target_qty", 1))
 
     any_changed = False
     for o in freighter_orders:
-        oid     = o["id"]
-        target  = o.get("target_qty", 0)
-        loaded  = o.get("loaded_qty", 0)
-        rem     = max(0, target - loaded)
-        pct     = calculations.progress_pct(loaded, target)
-        status  = o.get("status", STATUS_IN_QUEUE)
+        oid    = o["id"]
+        target = o.get("target_qty", 0)
+        loaded = o.get("loaded_qty", 0)
+        pct    = calculations.progress_pct(loaded, target)
+        status = o.get("status", STATUS_IN_QUEUE)
 
-        # Use 10 columns: add one for the adjust button
-        col_chk, col_route, col_truck, col_driver, col_tgt, col_ld, col_rem, col_prog, col_stat, col_adj = st.columns(
-            [0.5, 2, 1.5, 2, 1, 1, 1, 2, 2, 0.8]
+        # 10 columns matching the header above
+        col_chk, col_route, col_order, col_driver, col_truck, col_bread, col_confect, col_prog, col_stat, col_adj = st.columns(
+            [0.4, 2, 1, 2, 1.5, 1.2, 1.2, 2, 1.8, 1]
         )
 
         with col_chk:
             checked = st.checkbox(
-                "", value=st.session_state[f"lp_checked_{oid}"],
+                "",
+                value=st.session_state[f"lp_checked_{oid}"],
                 key=f"lp_cb_{oid}",
                 label_visibility="collapsed",
             )
-
         with col_route:
-            st.markdown(f"**{o.get('route_name','')}**")
-        with col_truck:
-            st.markdown(o.get("truck_registration", ""))
+            st.markdown(f"**{o.get('route_name', '')}**")
+        with col_order:
+            # ORDER = target quantity (the planned order size for this route)
+            st.markdown(
+                f"<div style='text-align:right;font-weight:600'>{target:,}</div>",
+                unsafe_allow_html=True,
+            )
         with col_driver:
-            st.markdown(o.get("driver_name", ""))
-        with col_tgt:
-            st.markdown(f"<div style='text-align:right'>{target:,}</div>", unsafe_allow_html=True)
-        with col_ld:
-            st.markdown(f"<div style='text-align:right'>{loaded:,}</div>", unsafe_allow_html=True)
-        with col_rem:
-            st.markdown(f"<div style='text-align:right'>{rem:,}</div>", unsafe_allow_html=True)
+            st.markdown(o.get("driver_name", "TBA"))
+        with col_truck:
+            st.markdown(o.get("truck_registration", "TBA"))
+        with col_bread:
+            # BREAD QTY = loaded qty (what has physically gone on the truck)
+            st.markdown(
+                f"<div style='text-align:right'>{loaded:,}</div>",
+                unsafe_allow_html=True,
+            )
+        with col_confect:
+            # CONFECT QTY — reserved; schema currently stores single target_qty
+            st.markdown(
+                "<div style='text-align:right;color:#9ca3af'>—</div>",
+                unsafe_allow_html=True,
+            )
         with col_prog:
             st.markdown(_progress_bar_html(pct), unsafe_allow_html=True)
         with col_stat:
             st.markdown(_status_badge(status), unsafe_allow_html=True)
 
-        # ── Checkbox logic ──────────────────────────────────────────────
+        # ── Checkbox logic ───────────────────────────────────────────────
         prev_checked = st.session_state[f"lp_checked_{oid}"]
         if checked and not prev_checked:
-            # Tick → set loaded = target
             ok = db.update_loaded_qty(oid, target, auth.current_user())
             if ok:
                 st.session_state[f"lp_checked_{oid}"] = True
@@ -638,45 +680,39 @@ def render_loading_plan(orders: list[dict], dispatch_date: date) -> None:
             else:
                 st.error(f"Failed to update {o.get('route_name')}.")
         elif not checked and prev_checked:
-            # Untick → reset to 0
             ok = db.update_loaded_qty(oid, 0, auth.current_user())
             if ok:
                 st.session_state[f"lp_checked_{oid}"] = False
                 any_changed = True
 
-        # ── Adjustment button (popover) ─────────────────────────────────
+        # ── Adjust popover ───────────────────────────────────────────────
         with col_adj:
-            # Show adjust button only if the truck is ticked or already has some load
             if checked or loaded > 0:
-                with st.popover("⚙️ Adjust", use_container_width=True):
-                    st.markdown(f"**{o.get('route_name')}** — adjust actual loaded quantity")
+                with st.popover("⚙️", use_container_width=True):
+                    st.markdown(f"**{o.get('route_name')}** — adjust bread loaded qty")
                     adj_value = st.number_input(
-                        "Adjustment (+ add loaves, − reduce loaves)",
+                        "Adjustment (+ add loaves, − reduce)",
                         min_value=-target,
-                        max_value=target,
+                        max_value=target * 2,
                         value=0,
                         step=50,
                         key=f"lp_adj_input_{oid}",
-                        help="e.g. enter -800 if 800 fewer loaves were loaded than planned.",
+                        help="e.g. −800 if 800 fewer loaves were loaded than planned.",
                     )
                     if st.button("Apply", key=f"lp_adj_btn_{oid}"):
-                        current_loaded = db.get_order_by_id(oid)
-                        if current_loaded:
-                            new_qty = max(0, current_loaded["loaded_qty"] + adj_value)
-                            if new_qty < 0:
-                                st.warning("Adjustment would make loaded qty negative — not applied.")
-                            else:
-                                ok2 = db.update_loaded_qty(oid, new_qty, auth.current_user())
-                                if ok2:
-                                    st.success(
-                                        f"Adjusted {o.get('route_name','')} by "
-                                        f"{'+' if adj_value >= 0 else ''}{adj_value:,} loaves. "
-                                        f"New loaded = {new_qty:,}"
-                                    )
-                                    any_changed = True
-                                    st.rerun()
+                        current = db.get_order_by_id(oid)
+                        if current:
+                            new_qty = max(0, current["loaded_qty"] + adj_value)
+                            ok2 = db.update_loaded_qty(oid, new_qty, auth.current_user())
+                            if ok2:
+                                st.success(
+                                    f"{o.get('route_name','')} bread qty "
+                                    f"{'+' if adj_value >= 0 else ''}{adj_value:,} → {new_qty:,}"
+                                )
+                                any_changed = True
+                                st.rerun()
 
-        st.markdown("<hr style='margin:4px 0;border-color:#f1f5f9'>", unsafe_allow_html=True)
+        st.markdown("<hr style='margin:3px 0;border-color:#f1f5f9'>", unsafe_allow_html=True)
 
     if any_changed:
         st.rerun()
@@ -837,12 +873,19 @@ def render_import_panel(dispatch_date: date) -> None:
 
     st.markdown("---")
     st.subheader("Import Daily Order Sheet")
+    st.markdown(
+        "<small style='color:#6b7280'>&#9888;&#65039; The Excel sheet is used for "
+        "<b>Local routes only</b>. Freighter / depot orders are managed manually "
+        "via the Loading Plan and will <b>not</b> be affected by this import &mdash; "
+        "they are preserved automatically.</small>",
+        unsafe_allow_html=True,
+    )
 
     uploaded = st.file_uploader(
         "Upload Excel order sheet (.xlsx)",
         type=["xlsx"],
         key="order_upload",
-        help="Upload the daily Excel workbook. Both 'Orders' and 'Confect Orders' sheets are parsed.",
+        help="Imports Local route orders only. Freighter/depot rows are skipped — manage those in the Loading Plan.",
     )
 
     if uploaded is None:
@@ -854,13 +897,16 @@ def render_import_panel(dispatch_date: date) -> None:
 
     if warnings:
         for w in warnings:
-            st.warning(w)
+            if "Freighter" in w:
+                st.info(w)
+            else:
+                st.warning(w)
 
     if not orders:
-        st.error("No valid orders found in the uploaded file.")
+        st.error("No valid Local orders found in the uploaded file.")
         return
 
-    st.success(f"Found **{len(orders)}** valid orders")
+    st.success(f"Found **{len(orders)}** Local orders")
 
     # Preview
     preview_df = pd.DataFrame(orders)[
@@ -877,26 +923,47 @@ def render_import_panel(dispatch_date: date) -> None:
     st.dataframe(preview_df, use_container_width=True, height=300)
 
     total = sum(o["target_qty"] for o in orders)
-    freighters = [o for o in orders if o["route_type"] == "Freighter"]
-    locals_ = [o for o in orders if o["route_type"] == "Local"]
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Total Demand", f"{total:,}")
-    col2.metric("Freighter Routes", len(freighters))
-    col3.metric("Local Routes", len(locals_))
+    # All orders at this point are Local (Freighters filtered in importer)
+    col1, col2 = st.columns(2)
+    col1.metric("Local Demand (Total)", f"{total:,}")
+    col2.metric("Local Routes", len(orders))
 
     col_confirm, col_clear = st.columns([2, 1])
     with col_confirm:
         if st.button("Confirm Import", type="primary", use_container_width=True):
             with st.spinner("Saving orders…"):
-                existing = db.get_orders_for_date(dispatch_date)
-                if existing:
+                # ── Preserve manually-added Freighter orders ──────────────
+                # The Excel file only contains Local routes. Before wiping
+                # the date's orders we rescue any Freighter rows that were
+                # manually entered so they survive the re-import.
+                existing_all = db.get_orders_for_date(dispatch_date)
+                existing_freighters = [
+                    o for o in existing_all if o.get("route_type") == "Freighter"
+                ]
+
+                # Delete only Local orders for this date, leaving Freighters
+                # intact. If the DB layer doesn't expose a route-type-scoped
+                # delete we do it manually: delete all, then re-insert the
+                # rescued Freighters together with the new Locals.
+                if existing_all:
                     db.delete_orders_for_date(dispatch_date)
-                inserted, errors = db.bulk_insert_orders(orders)
+
+                # Re-insert rescued Freighters first, then imported Locals
+                all_to_insert = existing_freighters + orders
+                inserted, errors = db.bulk_insert_orders(all_to_insert)
+
+            rescued = len(existing_freighters)
+            local_inserted = inserted - rescued if inserted >= rescued else inserted
             if errors:
-                st.warning(f"Imported {inserted} orders with {errors} errors.")
+                st.warning(
+                    f"Imported {local_inserted} Local orders with {errors} errors. "
+                    f"{rescued} Freighter order(s) were preserved."
+                )
             else:
-                st.success(f"{inserted} orders imported successfully.")
+                msg = f"{local_inserted} Local orders imported successfully."
+                if rescued:
+                    msg += f" {rescued} Freighter order(s) preserved."
+                st.success(msg)
             st.rerun()
     with col_clear:
         if st.button("Clear Today's Orders", use_container_width=True):
@@ -1162,8 +1229,12 @@ def render_tv_mode(orders: list[dict], settings: dict) -> None:
                 st.info("No freighter orders for today.")
 
         else:
-            # ── Slide 3: Local routes board ─────────────────────────────
-            st.markdown("### 🚐 Local Routes Board")
+            # ── Slide 3: Local routes board (reference from Excel) ──────────
+            st.markdown("### 🚐 Local Routes — Reference Board")
+            st.markdown(
+                "<small style='color:#9ca3af'>Local route data imported from the daily Excel sheet — for reference only.</small>",
+                unsafe_allow_html=True,
+            )
             render_board_tab(locals_, hourly_rate, True, "Local")
 
     # Slide indicator dots
@@ -1177,179 +1248,6 @@ def render_tv_mode(orders: list[dict], settings: dict) -> None:
         f"· auto-advances every {SLIDE_SECONDS}s</div>",
         unsafe_allow_html=True,
     )
-
-
-# ===========================================================================
-# Loading Plan (Freighter / depot orders only)  — supervisor dashboard panel
-# ===========================================================================
-
-def render_loading_plan(orders: list[dict], dispatch_date: date) -> None:
-    """
-    Interactive loading plan for Freighter (depot) trucks only.
-    Each row has a checkbox; ticking it sets loaded_qty = target_qty.
-    For locals this function is not shown (per spec).
-    After ticking, an inline adjustment input appears for fine-tuning.
-    """
-    if not auth.can_edit():
-        return
-
-    freighter_orders = [o for o in orders if o.get("route_type") == "Freighter"]
-    if not freighter_orders:
-        st.info("No Freighter / depot orders for today.")
-        return
-
-    st.markdown(
-        "<small style='color:#6b7280'>Tick a truck to mark it fully loaded. "
-        "You can then adjust the actual quantity loaded.</small>",
-        unsafe_allow_html=True,
-    )
-    st.markdown("")
-
-    # Initialise per-order adjustment state
-    for o in freighter_orders:
-        oid = o["id"]
-        _ss_get(f"lp_checked_{oid}", o.get("loaded_qty", 0) >= o.get("target_qty", 1))
-        _ss_get(f"lp_adj_{oid}", 0)
-        _ss_get(f"lp_show_adj_{oid}", False)
-
-    # Table header
-    st.markdown(
-        "<table class='board-table'>"
-        "<thead><tr>"
-        "<th style='width:2rem'>✓</th>"
-        "<th>Route</th><th>Truck</th><th>Driver</th>"
-        "<th style='text-align:right'>Target</th>"
-        "<th style='text-align:right'>Loaded</th>"
-        "<th style='text-align:right'>Remaining</th>"
-        "<th>Progress</th><th>Status</th>"
-        "</tr></thead><tbody>",
-        unsafe_allow_html=True,
-    )
-
-    # Close the raw HTML table — we'll render each row as a Streamlit row
-    st.markdown("</tbody></table>", unsafe_allow_html=True)
-
-    # Render interactive rows below (Streamlit widgets can't go inside raw HTML)
-    any_changed = False
-    for o in freighter_orders:
-        oid     = o["id"]
-        target  = o.get("target_qty", 0)
-        loaded  = o.get("loaded_qty", 0)
-        rem     = max(0, target - loaded)
-        pct     = calculations.progress_pct(loaded, target)
-        status  = o.get("status", STATUS_IN_QUEUE)
-
-        col_chk, col_route, col_truck, col_driver, col_tgt, col_ld, col_rem, col_prog, col_stat = st.columns(
-            [0.5, 2, 1.5, 2, 1, 1, 1, 2, 2]
-        )
-
-        with col_chk:
-            checked = st.checkbox(
-                "", value=st.session_state[f"lp_checked_{oid}"],
-                key=f"lp_cb_{oid}",
-                label_visibility="collapsed",
-            )
-
-        with col_route:
-            st.markdown(f"**{o.get('route_name','')}**")
-        with col_truck:
-            st.markdown(o.get("truck_registration", ""))
-        with col_driver:
-            st.markdown(o.get("driver_name", ""))
-        with col_tgt:
-            st.markdown(f"<div style='text-align:right'>{target:,}</div>", unsafe_allow_html=True)
-        with col_ld:
-            st.markdown(f"<div style='text-align:right'>{loaded:,}</div>", unsafe_allow_html=True)
-        with col_rem:
-            st.markdown(f"<div style='text-align:right'>{rem:,}</div>", unsafe_allow_html=True)
-        with col_prog:
-            st.markdown(_progress_bar_html(pct), unsafe_allow_html=True)
-        with col_stat:
-            st.markdown(_status_badge(status), unsafe_allow_html=True)
-
-        # ── Checkbox just ticked → set loaded = target, show adj panel ──
-        prev_checked = st.session_state[f"lp_checked_{oid}"]
-        if checked and not prev_checked:
-            # First tick
-            ok = db.update_loaded_qty(oid, target, auth.current_user())
-            if ok:
-                st.session_state[f"lp_checked_{oid}"] = True
-                st.session_state[f"lp_show_adj_{oid}"] = True
-                any_changed = True
-            else:
-                st.error(f"Failed to update {o.get('route_name')}.")
-        elif not checked and prev_checked:
-            # Unticked → reset to 0
-            ok = db.update_loaded_qty(oid, 0, auth.current_user())
-            if ok:
-                st.session_state[f"lp_checked_{oid}"] = False
-                st.session_state[f"lp_show_adj_{oid}"] = False
-                any_changed = True
-
-        # ── Adjustment panel (shown after ticking or if previously adjusted) ─
-        if st.session_state.get(f"lp_show_adj_{oid}") or (checked and loaded > 0 and loaded < target):
-            with st.popover(f"↕ Adjust actual quantity for {o.get('route_name','')}"):
-                adj_col1, adj_col2, adj_col3 = st.columns([2, 1, 2])
-                with adj_col1:
-                    adj = st.number_input(
-                        "Adjustment (+ add loaves, − reduce loaves)",
-                        min_value=-target,
-                        max_value=target,
-                        value=0,
-                        step=50,
-                        key=f"lp_adj_input_{oid}",
-                        help="e.g. enter -800 if 800 fewer loaves were loaded than planned.",
-                    )
-                with adj_col2:
-                    st.markdown("<div style='margin-top:1.8rem'>", unsafe_allow_html=True)
-                    if st.button("Apply", key=f"lp_adj_btn_{oid}"):
-                        current_loaded = db.get_order_by_id(oid)
-                        if current_loaded:
-                            new_qty = max(0, current_loaded["loaded_qty"] + adj)
-                            if new_qty < 0:
-                                st.warning("Adjustment would make loaded qty negative — not applied.")
-                            else:
-                                ok2 = db.update_loaded_qty(oid, new_qty, auth.current_user())
-                                if ok2:
-                                    st.success(
-                                        f"Adjusted {o.get('route_name','')} by "
-                                        f"{'+'if adj>=0 else ''}{adj:,} loaves. "
-                                        f"New loaded = {new_qty:,}"
-                                    )
-                                    st.session_state[f"lp_show_adj_{oid}"] = False
-                                    any_changed = True
-                    st.markdown("</div>", unsafe_allow_html=True)
-                with adj_col3:
-                    refreshed = db.get_order_by_id(oid)
-                    if refreshed:
-                        st.markdown(
-                            f"<small>Current loaded: <b>{refreshed['loaded_qty']:,}</b> "
-                            f"/ target: <b>{target:,}</b></small>",
-                            unsafe_allow_html=True,
-                        )
-
-        st.markdown("<hr style='margin:4px 0;border-color:#f1f5f9'>", unsafe_allow_html=True)
-
-    if any_changed:
-        st.rerun()
-
-    # ── Bulk mark all as loaded ──────────────────────────────────────────
-    st.markdown("")
-    if st.button("✅ Mark ALL Freighters as Loaded", key="lp_bulk_load"):
-        count = 0
-        for o in freighter_orders:
-            if o.get("loaded_qty", 0) < o.get("target_qty", 0):
-                db.update_loaded_qty(o["id"], o["target_qty"], auth.current_user())
-                st.session_state[f"lp_checked_{o['id']}"] = True
-                count += 1
-        if count:
-            st.success(f"Marked {count} freighter trucks as fully loaded.")
-            st.rerun()
-
-
-# ===========================================================================
-# TV display mode
-# ===========================================================================
 
 
 # ===========================================================================
