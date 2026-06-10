@@ -161,7 +161,11 @@ def _render_login_page() -> None:
   
     col_l, col_m, col_r = st.columns([1, 2, 1])
     with col_m:
-        st.image(_LOGO_B64, width=120)
+        st.markdown(
+            f"<div style='display:flex;justify-content:center;margin-bottom:0.5rem;'>"
+            f"<img src='{_LOGO_B64}' width='120' style='display:block;'></div>",
+            unsafe_allow_html=True,
+        )
 
         st.markdown(
             """
