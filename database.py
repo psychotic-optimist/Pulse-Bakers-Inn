@@ -229,12 +229,19 @@ def bulk_insert_orders(orders: list[dict]) -> tuple[int, int]:
     return inserted, errors
 
 
-def delete_orders_for_date(dispatch_date: date) -> bool:
-    """Remove all orders for *dispatch_date* (used before re-import)."""
+def delete_orders_for_date(dispatch_date: date, route_type: Optional[str] = None) -> bool:
+    """
+    Remove orders for *dispatch_date*.
+    If *route_type* is given (e.g. "Local"), only that route type is deleted,
+    leaving the other type (e.g. Freighters) untouched.
+    """
     try:
-        _db().table("dispatch_orders").delete().eq(
+        q = _db().table("dispatch_orders").delete().eq(
             "dispatch_date", dispatch_date.isoformat()
-        ).execute()
+        )
+        if route_type is not None:
+            q = q.eq("route_type", route_type)
+        q.execute()
         return True
     except Exception as exc:
         logger.error("delete_orders_for_date error: %s", exc)
