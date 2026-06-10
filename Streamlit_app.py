@@ -347,7 +347,140 @@ def render_board_tab(
         f"<tbody>{rows_html}</tbody></table>",
         unsafe_allow_html=True,
     )
+def render_depot_matrix(dispatch_date: date) -> None:
+    """
+    Display depot orders as a matrix: rows = SKU names, columns = truck sub-routes
+    grouped by depot. Shows ordered/loaded quantities, progress bar background,
+    and provides Excel export.
+    """
+    depot_rows = ddb.get_depot_orders(dispatch_date)
+    if not depot_rows:
+        st.info("No depot orders imported for today. Use the Depot Pre-Alert import panel first.")
+        return
 
+    # Organise data: depot -> truck -> sku -> (ordered, loaded)
+    from collections import defaultdict
+    depots = defaultdict(lambda: defaultdict(lambda: {"ordered": 0, "loaded": 0}))
+    all_skus = set()
+    for r in depot_rows:
+        depot = r["depot_name"]
+        truck = r["truck_label"]
+        sku = r["sku_name"]
+        ordered = r["ordered_qty"]
+        loaded = r["loaded_qty"]
+        depots[depot][truck][sku]["ordered"] = ordered
+        depots[depot][truck][sku]["loaded"] = loaded
+        all_skus.add(sku)
+
+    # Sort SKUs: bread first, then confect
+    bread_keywords = ["SUPERIOR", "BROWN", "WHOLE GRAIN", "MR CHINGWA", "MRS CHINGWA", "DR CHINGWA", "SPAR WHITE", "SPAR BROWN", "SPAR WHOLE GRAIN"]
+    def sku_sort_key(sku):
+        if sku in bread_keywords:
+            return (0, bread_keywords.index(sku) if sku in bread_keywords else 999)
+        else:
+            return (1, sku)
+    sorted_skus = sorted(all_skus, key=sku_sort_key)
+
+    # Prepare data for export (list of dicts)
+    export_data = []
+    for sku in sorted_skus:
+        row = {"SKU": sku}
+        for depot, trucks in sorted(depots.items()):
+            for truck in sorted(trucks.keys()):
+                ordered = depots[depot][truck].get(sku, {}).get("ordered", 0)
+                loaded = depots[depot][truck].get(sku, {}).get("loaded", 0)
+                col_label = f"{depot} - {truck}"
+                row[f"{col_label} (ordered)"] = ordered
+                row[f"{col_label} (loaded)"] = loaded
+        export_data.append(row)
+
+    # ── Export to Excel button ──────────────────────────────────────────
+    if export_data:
+        df_export = pd.DataFrame(export_data)
+        # Reorder columns: SKU first, then each depot-truck pair
+        cols = ["SKU"] + [c for c in df_export.columns if c != "SKU"]
+        df_export = df_export[cols]
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            df_export.to_excel(writer, sheet_name="Depot Matrix", index=False)
+        excel_data = output.getvalue()
+        st.download_button(
+            label="📎 Export Depot Matrix to Excel",
+            data=excel_data,
+            file_name=f"depot_matrix_{dispatch_date.isoformat()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="export_depot_matrix",
+        )
+        st.caption("Download the full matrix with ordered & loaded quantities.")
+
+    # ── HTML/CSS for progress bar background ───────────────────────────
+    st.markdown(
+        """
+        <style>
+        .depot-matrix-table { border-collapse: collapse; width: 100%; font-size: 0.85rem; }
+        .depot-matrix-table th, .depot-matrix-table td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; vertical-align: top; }
+        .depot-matrix-table th { background-color: #1B2D6B; color: #C9A84C; font-weight: 700; }
+        .depot-matrix-table tr:nth-child(even) { background-color: #f9f9f9; }
+        .depot-matrix-table td:first-child { background-color: #f2f2f2; font-weight: 600; }
+        .progress-bg-cell {
+            background: linear-gradient(to right, #22c55e, #22c55e);
+            background-size: 0% 100%;
+            background-repeat: no-repeat;
+            transition: background-size 0.2s;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Build column headers (depot groups with truck sub-columns)
+    depot_trucks = []
+    for depot, trucks in sorted(depots.items()):
+        depot_trucks.append((depot, sorted(trucks.keys())))
+
+    header_html = "<tr>"
+    header_html += "<th>PRODUCT DESCRIPTION</th>"
+    for depot, trucks in depot_trucks:
+        header_html += f"<th colspan='{len(trucks)}' style='text-align:center'>{depot}</th>"
+    header_html += "</tr><tr>"
+    header_html += "<th></th>"
+    for depot, trucks in depot_trucks:
+        for truck in trucks:
+            header_html += f"<th style='text-align:center'>{truck}</th>"
+    header_html += "</tr>"
+
+    # Data rows with progress background and ordered/loaded display
+    rows_html = ""
+    for sku in sorted_skus:
+        rows_html += "<tr>"
+        rows_html += f"<td>{sku}</td>"
+        for depot, trucks in depot_trucks:
+            for truck in trucks:
+                ordered = depots[depot][truck].get(sku, {}).get("ordered", 0)
+                loaded = depots[depot][truck].get(sku, {}).get("loaded", 0)
+                pct = (loaded / ordered * 100) if ordered > 0 else 0
+                # background gradient width = progress %
+                bg_style = f"background: linear-gradient(to right, #d1fae5, #d1fae5); background-size: {min(pct, 100)}% 100%; background-repeat: no-repeat;"
+                display_text = f"{ordered:,}" if ordered > 0 else "—"
+                if ordered > 0 and loaded > 0:
+                    display_text = f"{ordered:,} ({loaded:,})"
+                elif ordered > 0:
+                    display_text = f"{ordered:,}"
+                # tooltip
+                title = f"{loaded:,} / {ordered:,} loaded ({pct:.0f}%)" if ordered > 0 else "No order"
+                rows_html += f"<td style='text-align:right; {bg_style}' title='{title}'>{display_text}</td>"
+        rows_html += "</tr>"
+
+    st.markdown(
+        f"<div style='overflow-x: auto; max-height: 600px;'>"
+        f"<table class='depot-matrix-table'>"
+        f"{header_html}"
+        f"{rows_html}"
+        f"</table>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    st.caption("Each cell: ordered quantity (loaded quantity). Background colour = % loaded. Hover for details.")
 
 # ===========================================================================
 # Loading Session tab (persistent, sequential Freighter → Local)
@@ -1662,11 +1795,13 @@ def main() -> None:
         with col_dl:
             render_export(orders)
 
-        board_tab_f, board_tab_l = st.tabs(["Freighters", "Local Routes"])
+        board_tab_f, board_tab_l, board_tab_m = st.tabs(["Freighters", "Local Routes", "📊 Depot Matrix"])
         with board_tab_f:
             render_board_tab(freighters, hourly_rate, False, "Freighter")
         with board_tab_l:
             render_board_tab(locals_, hourly_rate, False, "Local")
+        with board_tab_m:
+            render_depot_matrix(dispatch_date)
 
         # Loading Plan (depots / freighters only) - replaced with depot version
         st.markdown("---")
