@@ -563,6 +563,47 @@ def _render_loading_session_tab(orders: list[dict]) -> None:
 # Loading Session tab (persistent, sequential Freighter → Local)
 # ===========================================================================
 
+
+# ---------------------------------------------------------------------------
+# Depot loading ETC helpers
+# 24,000 loaves/hour is the fixed per-truck loading rate for freighter depots.
+# Trucks at the same depot load in parallel, so route ETC = slowest truck.
+# ---------------------------------------------------------------------------
+
+DEPOT_LOADING_RATE = 24_000  # loaves per hour, per truck (fixed)
+
+
+def _truck_etc(remaining_qty: int, now_local) -> "Optional[datetime]":
+    """Return ETC for a single truck given its remaining quantity."""
+    if remaining_qty <= 0:
+        return None
+    from datetime import timedelta
+    hours = remaining_qty / DEPOT_LOADING_RATE
+    return now_local + timedelta(hours=hours)
+
+
+def _route_etc(group: list[dict], now_local) -> "Optional[datetime]":
+    """Route ETC = max(truck ETC) — route done when the last truck finishes."""
+    etcs = []
+    for o in group:
+        rem = max(0, o.get("target_qty", 0) - o.get("loaded_qty", 0))
+        etc = _truck_etc(rem, now_local)
+        if etc is not None:
+            etcs.append(etc)
+    return max(etcs) if etcs else None
+
+
+def _fmt_etc(etc, now_local) -> str:
+    """Format ETC as HH:MM, or Done, or — ."""
+    if etc is None:
+        return "Done"
+    import pytz
+    tz = pytz.timezone(DISPLAY_TIMEZONE)
+    if etc.tzinfo is None:
+        etc = tz.localize(etc)
+    return etc.astimezone(tz).strftime("%H:%M")
+
+
 def render_loading_plan(orders: list[dict], dispatch_date: date) -> None:
     """
     Aggregated loading plan for Freighter (depot) trucks.
@@ -606,6 +647,7 @@ def render_loading_plan(orders: list[dict], dispatch_date: date) -> None:
         "<th style='text-align:center'>CONFECT QTY</th>"
         "<th>PROGRESS</th>"
         "<th>STATUS</th>"
+        "<th style='text-align:center'>EST. DONE</th>"
         "</tr></thead></table>",
         unsafe_allow_html=True,
     )
@@ -634,8 +676,12 @@ def render_loading_plan(orders: list[dict], dispatch_date: date) -> None:
         if qty_key not in st.session_state:
             st.session_state[qty_key] = total_target
 
-        col_route, col_order, col_driver, col_truck, col_qty, col_confect, col_prog, col_stat, col_save, col_all = st.columns(
-            [2, 1.2, 1.8, 1.5, 1.4, 1.2, 2, 1.8, 1, 1.2]
+        now_local = calculations.get_local_now()
+        route_etc = _route_etc(group, now_local)
+        etc_str   = _fmt_etc(route_etc, now_local) if agg_status != STATUS_LOADED else "Done"
+
+        col_route, col_order, col_driver, col_truck, col_qty, col_confect, col_prog, col_stat, col_etc, col_save, col_all = st.columns(
+            [2, 1.2, 1.8, 1.5, 1.4, 1.2, 2, 1.8, 1.2, 1, 1.2]
         )
 
         with col_route:
@@ -667,6 +713,12 @@ def render_loading_plan(orders: list[dict], dispatch_date: date) -> None:
             st.markdown(_progress_bar_html(pct), unsafe_allow_html=True)
         with col_stat:
             st.markdown(_status_badge(agg_status), unsafe_allow_html=True)
+        with col_etc:
+            color = "#166534" if etc_str == "Done" else "#1B2D6B"
+            st.markdown(
+                f"<div style='text-align:center;font-weight:700;color:{color}'>{etc_str}</div>",
+                unsafe_allow_html=True,
+            )
         with col_save:
             if st.button("Save", key=f"lp_save_{route_name}"):
                 # Distribute new_total proportionally across truck orders
@@ -1203,16 +1255,17 @@ def render_tv_mode(orders: list[dict], settings: dict) -> None:
                     )
 
         elif slide_index == 1:
-            # ── Slide 2: Aggregated depot table (read-only) ─────────────
+            # ── Slide 2: Aggregated depot table with ETC ────────────────
             st.markdown("### 📋 Depot Loading Plan")
             if freighters:
-                # Aggregate by route_name, same logic as interactive Loading Plan
                 from collections import defaultdict as _tvdd
+                tv_now = calculations.get_local_now()
                 tv_groups = _tvdd(list)
                 for o in freighters:
                     tv_groups[o["route_name"]].append(o)
 
                 rows_html = ""
+                all_route_etcs = []
                 for route_name, group in sorted(tv_groups.items()):
                     total_target = sum(o.get("target_qty", 0) for o in group)
                     total_loaded = sum(o.get("loaded_qty", 0) for o in group)
@@ -1230,6 +1283,12 @@ def render_tv_mode(orders: list[dict], settings: dict) -> None:
                     first_truck = next(
                         (o.get("truck_registration", "—") for o in group if o.get("truck_registration") not in ("TBA", "", None)), "—"
                     )
+                    # Per-route ETC
+                    r_etc = _route_etc(group, tv_now)
+                    if r_etc is not None:
+                        all_route_etcs.append(r_etc)
+                    r_etc_str = _fmt_etc(r_etc, tv_now) if agg_status != STATUS_LOADED else "Done"
+                    etc_color = "#166534" if r_etc_str == "Done" else "#1e40af"
                     rows_html += (
                         f"<tr>"
                         f"<td><b>{route_name}</b></td>"
@@ -1240,8 +1299,22 @@ def render_tv_mode(orders: list[dict], settings: dict) -> None:
                         f"<td style='text-align:right'>{total_rem:,}</td>"
                         f"<td>{_progress_bar_html(pct)}</td>"
                         f"<td>{_status_badge(agg_status)}</td>"
+                        f"<td style='text-align:center;font-weight:700;color:{etc_color}'>{r_etc_str}</td>"
                         f"</tr>"
                     )
+
+                # All-depots finish estimate
+                all_done_str = "All depots loaded" if not all_route_etcs else (
+                    "All depots done by " + _fmt_etc(max(all_route_etcs), tv_now)
+                )
+                banner_color = "#166534" if not all_route_etcs else "#1B2D6B"
+                st.markdown(
+                    f"<div style='background:#f0f4ff;border-left:5px solid {banner_color};"
+                    f"padding:0.5rem 1rem;border-radius:6px;margin-bottom:0.75rem;"
+                    f"font-size:1.2rem;font-weight:700;color:{banner_color}'>"
+                    f"⏱ {all_done_str}</div>",
+                    unsafe_allow_html=True,
+                )
                 st.markdown(
                     "<table class='board-table'><thead><tr>"
                     "<th>ROUTE</th><th>DRIVER</th><th>TRUCK</th>"
@@ -1249,6 +1322,7 @@ def render_tv_mode(orders: list[dict], settings: dict) -> None:
                     "<th style='text-align:right'>LOADED</th>"
                     "<th style='text-align:right'>REMAINING</th>"
                     "<th>PROGRESS</th><th>STATUS</th>"
+                    "<th style='text-align:center'>EST. DONE</th>"
                     f"</tr></thead><tbody>{rows_html}</tbody></table>",
                     unsafe_allow_html=True,
                 )
