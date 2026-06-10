@@ -1478,7 +1478,7 @@ def render_tv_mode(orders: list[dict], settings: dict) -> None:
         elif 1 <= slide_index <= len(depot_names):
             depot_summary = depot_summaries[slide_index - 1]
             depot_name    = depot_summary["depot_name"]
-            depot_rows    = depot_summary["rows"]
+            depot_rows    = depot_summary.get("rows") or depot_db.get_depot_orders_by_depot(today, depot_summary["depot_name"])
             truck_labels  = depot_summary["trucks"]
 
             # truck registrations dict
