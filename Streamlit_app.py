@@ -1630,6 +1630,50 @@ def render_search(dispatch_date: date, hourly_rate: int) -> None:
 # TV display mode
 # ===========================================================================
 
+
+def _render_tv_kpi_cards(
+    orders: list[dict],
+    settings: dict,
+    depot_summaries: list[dict],
+    now_local,
+) -> None:
+    buffer = settings.get("current_bin_level", 0)
+    rate = settings.get("hourly_production_rate", 5000)
+    total_demand = calculations.kpi_total_demand(orders)
+    total_remaining = calculations.kpi_total_remaining(orders)
+    overall_pct = calculations.kpi_overall_progress(orders)
+
+    depot_etcs = []
+    for summary in depot_summaries:
+        depot_rows = summary.get("rows") or []
+        truck_labels = summary.get("trucks") or []
+        for tl in truck_labels:
+            truck_rows = [r for r in depot_rows if r["truck_label"] == tl]
+            remaining = sum(max(0, r["ordered_qty"] - r.get("loaded_qty", 0)) for r in truck_rows)
+            if remaining > 0:
+                depot_etcs.append(now_local + timedelta(hours=remaining / DEPOT_LOADING_RATE))
+
+    if depot_etcs:
+        finish_dt = max(depot_etcs)
+        finish_str = finish_dt.strftime("%H:%M")
+        finish_delta = f"depot manifest ({len(depot_summaries)} depots)"
+    else:
+        finish_dt = calculations.kpi_estimated_finish(orders, rate, buffer)
+        finish_str = calculations.format_etc(finish_dt) if finish_dt else "Done"
+        finish_delta = "production rate est."
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    cards = [
+        (c1, "Opening Stock", f"{buffer:,}", "loaves in bin"),
+        (c2, "Loading Rate", f"{DEPOT_LOADING_RATE // 1000}k", "loaves/hr per truck"),
+        (c3, "Total Manifest", f"{total_demand:,}", "loaves today"),
+        (c4, "Remaining", f"{total_remaining:,}", f"{overall_pct:.0f}% loaded"),
+        (c5, "Est. Finish", finish_str, finish_delta),
+    ]
+    for col, label, value, delta in cards:
+        with col:
+            st.markdown(_kpi_card(label, value, delta), unsafe_allow_html=True)
+
 def render_tv_mode(orders: list[dict], settings: dict) -> None:
     """
     Full-screen TV display.
@@ -1713,10 +1757,11 @@ def render_tv_mode(orders: list[dict], settings: dict) -> None:
     today = date.today()
     depot_summaries = depot_db.get_depot_summary(today)
 
-    # Build slide list: [0=KPI, 1..N=depot, last=local]
+    # Build slide list: [0=KPI, 1..N=depot, optionally last=local]
     depot_names = [s["depot_name"] for s in depot_summaries]
     SLIDE_SECONDS = 15
-    n_slides = 1 + len(depot_names) + 1  # KPI + depots + local
+    show_local_slide = bool(locals_)
+    n_slides = 1 + len(depot_names) + (1 if show_local_slide else 0)
     slide_index = (int(now_local.timestamp()) // SLIDE_SECONDS) % max(n_slides, 1)
 
     slide_placeholder = st.empty()
@@ -1725,7 +1770,7 @@ def render_tv_mode(orders: list[dict], settings: dict) -> None:
         # ── Slide 0: KPI overview ───────────────────────────────────────
         if slide_index == 0:
             st.markdown("### 📊 Operations Overview")
-            render_kpi_cards(orders, settings)
+            _render_tv_kpi_cards(orders, settings, depot_summaries, now_local)
             for sess_key, label in [("freight", "Freighters"), ("local", "Local Routes")]:
                 if st.session_state.get(f"sess_{sess_key}_started"):
                     done  = st.session_state.get(f"sess_{sess_key}_done", 0)
@@ -1815,13 +1860,13 @@ def render_tv_mode(orders: list[dict], settings: dict) -> None:
                 unsafe_allow_html=True,
             )
 
-        # ── Last slide: Local routes ────────────────────────────────────
-        else:
+        # ── Last slide: Local routes (only shown when locals_ is non-empty) ──
+        elif show_local_slide:
             st.markdown("### 🚐 Local Routes Board")
             render_board_tab(locals_, hourly_rate, True, "Local")
 
     # Slide indicator dots
-    slide_labels = ["Overview"] + depot_names + ["Local Routes"]
+    slide_labels = ["Overview"] + depot_names + (["Local Routes"] if show_local_slide else [])
     current_label = slide_labels[slide_index] if slide_index < len(slide_labels) else "—"
     dots = " &nbsp; ".join(
         f"<span style='color:{'#1B2D6B' if i == slide_index else '#d1d5db'};font-size:1.2rem;'>●</span>"
