@@ -1461,10 +1461,8 @@ def render_import_panel(dispatch_date: date) -> None:
             st.success("Today's orders cleared.")
             st.rerun()
 
-    # ── Depot SKU entry ───────────────────────────────────────────────
-    st.markdown("")
-    with st.expander("📦 Depot Loading Plan — SKU Entry", expanded=False):
-        render_depot_entry_panel(dispatch_date)
+
+
 
 
 # ===========================================================================
@@ -1842,7 +1840,7 @@ def main() -> None:
         st.markdown("---")
         nav = st.radio(
             "Navigation",
-            ["Dashboard", "Search", "Audit Trail", "Users"],
+            ["Dashboard", "Depot Loading Plan", "Search", "Audit Trail", "Users"],
             label_visibility="collapsed",
         )
 
@@ -1898,16 +1896,71 @@ def main() -> None:
         with board_tab_l:
             render_board_tab(locals_, hourly_rate, False, "Local")
 
-        # Loading Plan (depots / freighters only)
-        st.markdown("---")
-        with st.expander("📋 Loading Plan — Freighter / Depot Trucks", expanded=False):
-            render_loading_plan(orders, dispatch_date)
 
         # Supervisor controls
         render_supervisor_controls(orders, dispatch_date)
 
         # Charts
         render_charts(orders)
+        _render_pulse_footer()
+
+    elif nav == "Depot Loading Plan":
+        st.markdown(
+            f"""
+            <div class='bi-page-header'>
+                <img src='{_LOGO_B64}' alt='Baker\'s Inn' />
+                <div>
+                    <p class='bi-page-header-title'>Depot Loading Plan</p>
+                    <p class='bi-page-header-sub'>{dispatch_date.strftime('%A, %d %B %Y')} &nbsp;&middot;&nbsp; Enter quantities before or after the order sheet arrives</p>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # ── Entry form (supervisor/admin only) ───────────────────────────
+        if auth.can_edit():
+            render_depot_entry_panel(dispatch_date)
+        else:
+            st.info("Sign in as supervisor or admin to enter depot quantities.")
+
+        # ── Live SKU table — shows whatever is already saved ─────────────
+        st.markdown("---")
+        st.subheader("Saved depot breakdown")
+        depot_summaries = depot_db.get_depot_summary(dispatch_date)
+        if not depot_summaries:
+            st.info("No depot orders saved yet for this date. Use the form above to enter quantities.")
+        else:
+            now_local = calculations.get_local_now()
+            for summary in depot_summaries:
+                depot_name_s   = summary["depot_name"]
+                truck_labels_s = summary["trucks"]
+                depot_rows_s   = summary.get("rows") or depot_db.get_depot_orders_by_depot(
+                    dispatch_date, depot_name_s
+                )
+                truck_regs_s: dict[str, str] = {}
+                for r in depot_rows_s:
+                    if r["truck_label"] not in truck_regs_s and r.get("truck_registration"):
+                        truck_regs_s[r["truck_label"]] = r["truck_registration"]
+
+                total_ordered = summary["total_ordered"]
+                total_loaded  = summary["total_loaded"]
+                pct = calculations.progress_pct(total_loaded, total_ordered)
+
+                with st.expander(
+                    f"▸ {depot_name_s}  —  {total_ordered:,} ordered  |  {total_loaded:,} loaded  ({pct:.0f}%)",
+                    expanded=True,
+                ):
+                    table_html = _build_depot_sku_table(
+                        depot_name_s, truck_labels_s, truck_regs_s,
+                        depot_rows_s, show_loaded=True,
+                    )
+                    st.markdown(table_html, unsafe_allow_html=True)
+                    st.markdown(
+                        _progress_bar_html(pct),
+                        unsafe_allow_html=True,
+                    )
+
         _render_pulse_footer()
 
     elif nav == "Search":
