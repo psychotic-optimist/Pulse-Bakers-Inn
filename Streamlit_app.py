@@ -21,7 +21,7 @@ import dispatch_auth as auth
 import calculations
 import database as db
 import depot_database as depot_db
-from depot_importer import parse_depot_excel
+
 from config import (
     ALL_STATUSES,
     AUTOREFRESH_MS,
@@ -964,58 +964,290 @@ def render_loading_plan(orders: list[dict], dispatch_date: date) -> None:
             st.success(f"Marked {count} freighter trucks as fully loaded.")
             st.rerun()
 
-def render_depot_import_panel(dispatch_date: date) -> None:
-    """Upload and import the per-depot Excel breakdown (DEPOT_ORDERS_*.xlsx)."""
-    if not auth.can_upload():
+
+# ---------------------------------------------------------------------------
+# Known depot names — supervisor picks from this list (or types a custom name)
+# ---------------------------------------------------------------------------
+_KNOWN_DEPOTS: list[str] = [
+    "HATCLIFF",
+    "MUTARE",
+    "CHINHOYI",
+    "BINDURA",
+    "CHEGUTU",
+    "MUREWA",
+    "MT DARWIN",
+    "MAPINI",
+]
+
+# Maximum trucks per depot supported by the manual entry form
+_MAX_TRUCKS = 6
+
+
+def _depot_entry_key(depot: str, truck_idx: int, sku: str, field: str = "qty") -> str:
+    """Stable session-state key for a single depot/truck/sku cell."""
+    safe = depot.replace(" ", "_").replace("/", "_")
+    safe_sku = sku.replace(" ", "_").replace("(", "").replace(")", "").replace("/", "_")
+    return f"depot_entry_{safe}_{truck_idx}_{safe_sku}_{field}"
+
+
+def render_depot_entry_panel(dispatch_date: date) -> None:
+    """
+    Manual SKU-quantity entry form for depot (freighter) orders.
+
+    Supervisors pick a depot, define up to _MAX_TRUCKS trucks, then fill in
+    the ordered quantity for every bread and confectionary SKU.
+    The same depot_orders schema is produced as the old Excel importer,
+    so the TV slideshow and SKU table work unchanged.
+    """
+    if not auth.can_edit():
+        st.info("Supervisor or admin access required to enter depot orders.")
         return
 
-    uploaded = st.file_uploader(
-        "Upload Depot Order Sheet (.xlsx)",
-        type=["xlsx"],
-        key="depot_order_upload",
-        help="Upload the DEPOT_ORDERS Excel file. Each depot sheet is parsed automatically.",
+    # ── Step 1: depot selection ───────────────────────────────────────────
+    st.markdown(
+        "<small style='color:#6b7280'>Enter the SKU breakdown for a depot's loading plan. "
+        "The data populates the TV slideshow and the per-depot SKU table.</small>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("")
+
+    # Fetch today's existing depots so the user can see what's already saved
+    existing_rows = depot_db.get_depot_orders(dispatch_date)
+    saved_depots = sorted({r["depot_name"] for r in existing_rows})
+    if saved_depots:
+        st.markdown(
+            "<small style='color:#6b7280'>Already saved today: "
+            + ", ".join(f"**{d}**" for d in saved_depots)
+            + "</small>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("")
+
+    col_depot, col_custom = st.columns([3, 2])
+    with col_depot:
+        depot_choice = st.selectbox(
+            "Depot",
+            options=_KNOWN_DEPOTS + ["— Custom —"],
+            key="de_depot_select",
+        )
+    with col_custom:
+        custom_name = st.text_input(
+            "Custom depot name",
+            placeholder="e.g. GWERU",
+            key="de_depot_custom",
+            disabled=(depot_choice != "— Custom —"),
+        )
+
+    depot_name = (
+        custom_name.strip().upper()
+        if depot_choice == "— Custom —"
+        else depot_choice
+    )
+    if not depot_name:
+        st.warning("Enter a depot name to continue.")
+        return
+
+    # ── Step 2: truck setup ───────────────────────────────────────────────
+    st.markdown(f"**{depot_name}** — trucks")
+
+    n_trucks = st.number_input(
+        "Number of trucks",
+        min_value=1,
+        max_value=_MAX_TRUCKS,
+        value=_ss_get(f"de_{depot_name}_n_trucks", 2),
+        step=1,
+        key=f"de_{depot_name}_n_trucks_input",
+    )
+    st.session_state[f"de_{depot_name}_n_trucks"] = int(n_trucks)
+
+    truck_labels: list[str] = []
+    truck_regs: list[str] = []
+
+    truck_cols = st.columns(int(n_trucks))
+    for i, col in enumerate(truck_cols):
+        with col:
+            default_label = f"{depot_name} {i + 1}"
+            lbl = st.text_input(
+                "Truck label",
+                value=_ss_get(_depot_entry_key(depot_name, i, "", "label"), default_label),
+                key=_depot_entry_key(depot_name, i, "", "label"),
+                label_visibility="collapsed" if i > 0 else "visible",
+            )
+            reg = st.text_input(
+                "Registration",
+                placeholder="e.g. AEW 9912",
+                value=_ss_get(_depot_entry_key(depot_name, i, "", "reg"), ""),
+                key=_depot_entry_key(depot_name, i, "", "reg"),
+                label_visibility="collapsed" if i > 0 else "visible",
+            )
+            truck_labels.append(lbl.strip().upper() or default_label.upper())
+            truck_regs.append(reg.strip().upper())
+
+    # ── Step 3: SKU quantity grid ─────────────────────────────────────────
+    st.markdown("")
+
+    # Pre-load existing saved values for this depot so the grid is editable
+    # rather than always blank when the supervisor re-opens the form.
+    saved_index: dict[tuple, dict] = {}
+    for r in existing_rows:
+        if r["depot_name"] == depot_name:
+            saved_index[(r["sku_name"], r["truck_label"])] = r
+
+    def _get_saved_qty(sku: str, truck_lbl: str) -> int:
+        r = saved_index.get((sku, truck_lbl))
+        return r["ordered_qty"] if r else 0
+
+    # Column headers
+    header_cols = st.columns([2] + [1] * int(n_trucks))
+    with header_cols[0]:
+        st.markdown(
+            "<div style='font-size:0.78em;font-weight:700;color:#1B2D6B;"
+            "text-transform:uppercase;letter-spacing:.5px'>Product</div>",
+            unsafe_allow_html=True,
+        )
+    for i in range(int(n_trucks)):
+        with header_cols[i + 1]:
+            st.markdown(
+                f"<div style='font-size:0.78em;font-weight:700;color:#1B2D6B;"
+                f"text-transform:uppercase;letter-spacing:.5px;text-align:center'>"
+                f"{truck_labels[i]}</div>",
+                unsafe_allow_html=True,
+            )
+
+    # Bread section header
+    st.markdown(
+        "<div style='background:#1B2D6B;color:#C9A84C;font-size:0.78em;"
+        "font-weight:700;padding:4px 8px;border-radius:4px;margin:6px 0 4px 0;"
+        "text-transform:uppercase;letter-spacing:.5px'>— Bread SKUs —</div>",
+        unsafe_allow_html=True,
     )
 
-    if uploaded is None:
-        return
+    for sku in BREAD_SKUS_ORDER:
+        row_cols = st.columns([2] + [1] * int(n_trucks))
+        with row_cols[0]:
+            st.markdown(
+                f"<div style='font-size:0.85em;padding:4px 0;line-height:1.4'>{sku}</div>",
+                unsafe_allow_html=True,
+            )
+        for i in range(int(n_trucks)):
+            with row_cols[i + 1]:
+                default_val = _get_saved_qty(sku, truck_labels[i])
+                st.number_input(
+                    sku,
+                    min_value=0,
+                    value=_ss_get(
+                        _depot_entry_key(depot_name, i, sku),
+                        default_val,
+                    ),
+                    step=50,
+                    key=_depot_entry_key(depot_name, i, sku),
+                    label_visibility="collapsed",
+                )
 
-    file_bytes = uploaded.read()
-    with st.spinner("Parsing depot order sheet…"):
-        rows, warnings = parse_depot_excel(file_bytes, dispatch_date)
+    # Confect section header
+    st.markdown(
+        "<div style='background:#374151;color:#e5e7eb;font-size:0.78em;"
+        "font-weight:700;padding:4px 8px;border-radius:4px;margin:10px 0 4px 0;"
+        "text-transform:uppercase;letter-spacing:.5px'>— Confectionary SKUs —</div>",
+        unsafe_allow_html=True,
+    )
 
-    if warnings:
-        for w in warnings:
-            st.warning(w)
+    for sku in CONFECT_SKUS_ORDER:
+        row_cols = st.columns([2] + [1] * int(n_trucks))
+        with row_cols[0]:
+            st.markdown(
+                f"<div style='font-size:0.85em;padding:4px 0;line-height:1.4'>{sku}</div>",
+                unsafe_allow_html=True,
+            )
+        for i in range(int(n_trucks)):
+            with row_cols[i + 1]:
+                default_val = _get_saved_qty(sku, truck_labels[i])
+                st.number_input(
+                    sku,
+                    min_value=0,
+                    value=_ss_get(
+                        _depot_entry_key(depot_name, i, sku),
+                        default_val,
+                    ),
+                    step=10,
+                    key=_depot_entry_key(depot_name, i, sku),
+                    label_visibility="collapsed",
+                )
 
-    if not rows:
-        st.error("No valid depot orders found in the uploaded file.")
-        return
+    # ── Step 4: save / clear ──────────────────────────────────────────────
+    st.markdown("")
+    col_save, col_clear_depot, col_clear_all = st.columns([2, 1.5, 1.5])
 
-    # Preview grouped by depot
-    depots_found = sorted({r["depot_name"] for r in rows})
-    st.success(f"Found **{len(rows)}** SKU rows across **{len(depots_found)}** depots: {', '.join(depots_found)}")
+    with col_save:
+        if st.button(
+            f"💾 Save {depot_name} orders",
+            type="primary",
+            use_container_width=True,
+            key=f"de_save_{depot_name}",
+        ):
+            rows_to_upsert: list[dict] = []
+            for i, truck_lbl in enumerate(truck_labels):
+                reg = truck_regs[i]
+                for sku in BREAD_SKUS_ORDER:
+                    qty = st.session_state.get(_depot_entry_key(depot_name, i, sku), 0)
+                    rows_to_upsert.append({
+                        "dispatch_date":      dispatch_date.isoformat(),
+                        "depot_name":         depot_name,
+                        "truck_label":        truck_lbl,
+                        "truck_registration": reg,
+                        "sku_name":           sku,
+                        "sku_group":          "bread",
+                        "ordered_qty":        int(qty),
+                        "loaded_qty":         saved_index.get((sku, truck_lbl), {}).get("loaded_qty", 0),
+                        "status":             saved_index.get((sku, truck_lbl), {}).get("status", "In Queue"),
+                    })
+                for sku in CONFECT_SKUS_ORDER:
+                    qty = st.session_state.get(_depot_entry_key(depot_name, i, sku), 0)
+                    rows_to_upsert.append({
+                        "dispatch_date":      dispatch_date.isoformat(),
+                        "depot_name":         depot_name,
+                        "truck_label":        truck_lbl,
+                        "truck_registration": reg,
+                        "sku_name":           sku,
+                        "sku_group":          "confect",
+                        "ordered_qty":        int(qty),
+                        "loaded_qty":         saved_index.get((sku, truck_lbl), {}).get("loaded_qty", 0),
+                        "status":             saved_index.get((sku, truck_lbl), {}).get("status", "In Queue"),
+                    })
 
-    with st.expander("Preview (first 100 rows)", expanded=False):
-        preview = pd.DataFrame(rows[:100])[[
-            "depot_name", "truck_label", "sku_group", "sku_name", "ordered_qty"
-        ]]
-        st.dataframe(preview, use_container_width=True, height=300)
-
-    col_confirm, col_clear = st.columns([2, 1])
-    with col_confirm:
-        if st.button("Confirm Depot Import", type="primary", use_container_width=True, key="depot_import_confirm"):
-            with st.spinner("Saving depot orders…"):
-                depot_db.delete_depot_orders_for_date(dispatch_date)
-                upserted, errors = depot_db.upsert_depot_orders(rows)
+            # Delete this depot's existing rows then upsert fresh
+            depot_db.delete_depot_orders_for_date(dispatch_date, depot_name=depot_name)
+            upserted, errors = depot_db.upsert_depot_orders(rows_to_upsert)
             if errors:
-                st.warning(f"Imported {upserted} rows with {errors} errors.")
+                st.warning(f"Saved {upserted} rows with {errors} errors.")
             else:
-                st.success(f"{upserted} depot SKU rows imported for {len(depots_found)} depots.")
+                total_non_zero = sum(
+                    1 for r in rows_to_upsert if r["ordered_qty"] > 0
+                )
+                st.success(
+                    f"{depot_name} saved — {int(n_trucks)} truck(s), "
+                    f"{total_non_zero} SKUs with quantities."
+                )
             st.rerun()
-    with col_clear:
-        if st.button("Clear Depot Orders", use_container_width=True, key="depot_clear"):
+
+    with col_clear_depot:
+        if st.button(
+            f"🗑 Clear {depot_name}",
+            use_container_width=True,
+            key=f"de_clear_depot_{depot_name}",
+        ):
+            depot_db.delete_depot_orders_for_date(dispatch_date, depot_name=depot_name)
+            st.success(f"{depot_name} orders cleared.")
+            st.rerun()
+
+    with col_clear_all:
+        if st.button(
+            "🗑 Clear ALL depots",
+            use_container_width=True,
+            key="de_clear_all",
+        ):
             depot_db.delete_depot_orders_for_date(dispatch_date)
-            st.success("Depot orders cleared.")
+            st.success("All depot orders cleared for today.")
             st.rerun()
 
 
@@ -1229,16 +1461,10 @@ def render_import_panel(dispatch_date: date) -> None:
             st.success("Today's orders cleared.")
             st.rerun()
 
-    # ── Depot SKU breakdown import ────────────────────────────────────
+    # ── Depot SKU entry ───────────────────────────────────────────────
     st.markdown("")
-    with st.expander("📦 Depot Order Sheet — SKU Breakdown Import", expanded=False):
-        st.markdown(
-            "<small style='color:#6b7280'>Upload the per-depot Excel file "
-            "(DEPOT_ORDERS_*.xlsx) to populate the TV depot slideshow and "
-            "the SKU-level loading plan.</small>",
-            unsafe_allow_html=True,
-        )
-        render_depot_import_panel(dispatch_date)
+    with st.expander("📦 Depot Loading Plan — SKU Entry", expanded=False):
+        render_depot_entry_panel(dispatch_date)
 
 
 # ===========================================================================
