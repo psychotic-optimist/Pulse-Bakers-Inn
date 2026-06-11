@@ -626,12 +626,14 @@ def _build_depot_sku_table(
     truck_regs: dict[str, str],
     rows: list[dict],
     show_loaded: bool = False,
+    hide_zero_confect: bool = False,
 ) -> str:
     """
     Build the HTML SKU breakdown table exactly matching the screenshot.
     rows: list of depot_orders dicts for this depot.
     truck_labels: ordered list of truck sub-route labels (e.g. ["HATCLIFF 1", "HATCLIFF 2"])
     truck_regs: {truck_label: registration}
+    hide_zero_confect: if True (TV mode), skip confect rows where every truck has qty=0.
     """
     # Index rows by (sku_name, truck_label) → row dict
     idx: dict[tuple, dict] = {}
@@ -702,8 +704,14 @@ def _build_depot_sku_table(
         total_bread_cells += f"<td><b>{t:,}</b></td>"
     body += f"<tr class='total-bread-row'><{total_bread_cells}</tr>"
 
-    # Confect rows
+    # Confect rows — on TV skip rows where every truck has qty=0
     for sku in confect_skus:
+        all_qtys = [
+            (idx.get((sku, tl)) or {}).get("ordered_qty", 0)
+            for tl in truck_labels
+        ]
+        if hide_zero_confect and all(q == 0 for q in all_qtys):
+            continue
         cells = f"<td class='sku-label'>{sku}</td>"
         for tl in truck_labels:
             r = idx.get((sku, tl))
@@ -1634,14 +1642,41 @@ def render_tv_mode(orders: list[dict], settings: dict) -> None:
 
     tv_css = """
     <style>
-    #MainMenu, footer, header, [data-testid="stSidebar"] { display:none !important; }
-    .block-container { padding: 0.5rem 1rem !important; max-width:100% !important; }
-    h1 { font-size: 3rem !important; }
-    .board-table { font-size: 1.1rem; }
-    .board-table th { font-size: 1rem; }
-    .tv-slide-indicator { text-align:center; font-size:0.85rem; color:#9ca3af; margin-top:0.5rem; }
-    .depot-sku-table { font-size: 1rem; }
-    .depot-sku-table th { font-size: 0.92rem; }
+    #MainMenu, footer, header, [data-testid="stSidebar"],
+    [data-testid="stToolbar"], [data-testid="stDecoration"] { display:none !important; }
+
+    html, body { overflow: hidden !important; height: 100vh !important; }
+    .block-container {
+        padding: 0.4rem 1.2rem 0 1.2rem !important;
+        max-width: 100% !important;
+        height: 100vh !important;
+        overflow: hidden !important;
+    }
+
+    html, body, [class*="css"] { font-size: 1.15rem !important; }
+
+    .board-table { font-size: 1.05rem !important; }
+    .board-table th { font-size: 0.95rem !important; padding: 7px 10px !important; }
+    .board-table td { padding: 6px 10px !important; }
+
+    .kpi-value { font-size: 2.4rem !important; }
+    .kpi-label { font-size: 0.78rem !important; }
+
+    .depot-sku-table { font-size: 0.95rem !important; }
+    .depot-sku-table th { font-size: 0.85rem !important; padding: 5px 8px !important; }
+    .depot-sku-table td { padding: 3px 8px !important; line-height: 1.25 !important; }
+    .depot-sku-table td.qty-pos { font-size: 1rem !important; font-weight: 700 !important; }
+    .depot-sku-table tr.total-bread-row td { padding: 5px 8px !important; font-size: 1rem !important; }
+
+    .prog-bg { height: 12px !important; }
+    .prog-fill { height: 12px !important; }
+
+    .tv-slide-indicator {
+        text-align: center; font-size: 0.8rem;
+        color: #9ca3af; margin-top: 0.25rem; padding-bottom: 0.2rem;
+    }
+
+    .depot-slide-header { font-size: 1.2rem !important; padding: 0.4rem 0.9rem !important; }
     </style>
     """
     st.markdown(tv_css, unsafe_allow_html=True)
@@ -1649,14 +1684,22 @@ def render_tv_mode(orders: list[dict], settings: dict) -> None:
     now_local = calculations.get_local_now()
     now_str = now_local.strftime("%A %d %B %Y  %H:%M")
 
-    # Header
+    # Header — compact strip so table fills maximum vertical space
     st.markdown(
         f"""
-        <div style='display:flex;align-items:center;justify-content:center;gap:1.5rem;padding:0.5rem 0 0.75rem 0;'>
-            <img src='{_LOGO_B64}' alt='Baker\'s Inn' style='height:60px;width:auto;' />
-            <div>
-                <div style='font-size:1.8rem;font-weight:800;color:#1B2D6B;line-height:1.1;'>Dispatch Board</div>
-                <div style='font-size:1rem;color:#C9A84C;font-weight:700;letter-spacing:1px;text-transform:uppercase;'>{now_str}</div>
+        <div style='display:flex;align-items:center;gap:1.2rem;padding:0.3rem 0 0.5rem 0;
+                    border-bottom:2px solid #C9A84C;margin-bottom:0.5rem;'>
+            <img src='{_LOGO_B64}' alt='Baker\'s Inn' style='height:48px;width:auto;' />
+            <div style='flex:1;'>
+                <span style='font-size:1.6rem;font-weight:800;color:#1B2D6B;'>
+                    Baker's Inn — Dispatch Board
+                </span>
+            </div>
+            <div style='text-align:right;'>
+                <span style='font-size:1.05rem;color:#C9A84C;font-weight:700;
+                             letter-spacing:1px;text-transform:uppercase;'>
+                    {now_str}
+                </span>
             </div>
         </div>
         """,
@@ -1745,9 +1788,10 @@ def render_tv_mode(orders: list[dict], settings: dict) -> None:
                 f"<div class='depot-slide-header'>► LOADING BREAKDOWN — {depot_name}</div>",
                 unsafe_allow_html=True,
             )
-            # SKU table
+            # SKU table — hide zero-qty confect rows on TV to fit screen
             table_html = _build_depot_sku_table(
-                depot_name, truck_labels, truck_regs, depot_rows, show_loaded=True
+                depot_name, truck_labels, truck_regs, depot_rows,
+                show_loaded=True, hide_zero_confect=True,
             )
             st.markdown(table_html, unsafe_allow_html=True)
 
