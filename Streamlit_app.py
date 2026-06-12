@@ -328,12 +328,6 @@ def render_board_tab(
         return
 
     augmented = calculations.augment_orders(orders, hourly_rate)
-    # Drop rows where nothing was ordered and nothing was loaded
-    augmented = [o for o in augmented if o.get("target_qty", 0) > 0 or o.get("loaded_qty", 0) > 0]
-
-    if not augmented:
-        st.info(f"No {tab_label} orders with quantities for today.")
-        return
 
     rows_html = ""
     for o in augmented:
@@ -633,6 +627,7 @@ def _build_depot_sku_table(
     rows: list[dict],
     show_loaded: bool = False,
     hide_zero_confect: bool = False,
+    hide_zero_bread: bool = False,
 ) -> str:
     """
     Build the HTML SKU breakdown table exactly matching the screenshot.
@@ -640,6 +635,7 @@ def _build_depot_sku_table(
     truck_labels: ordered list of truck sub-route labels (e.g. ["HATCLIFF 1", "HATCLIFF 2"])
     truck_regs: {truck_label: registration}
     hide_zero_confect: if True (TV mode), skip confect rows where every truck has qty=0.
+    hide_zero_bread: if True (TV mode), skip bread rows where every truck has qty=0.
     """
     # Index rows by (sku_name, truck_label) → row dict
     idx: dict[tuple, dict] = {}
@@ -689,6 +685,12 @@ def _build_depot_sku_table(
     confect_skus = [s for s in sku_order if s not in bread_skus]
 
     for sku in bread_skus:
+        all_qtys = [
+            (idx.get((sku, tl)) or {}).get("ordered_qty", 0)
+            for tl in truck_labels
+        ]
+        if hide_zero_bread and all(q == 0 for q in all_qtys):
+            continue
         cells = f"<td class='sku-label'>{sku}</td>"
         for tl in truck_labels:
             r = idx.get((sku, tl))
@@ -1794,10 +1796,10 @@ def render_tv_mode(orders: list[dict], settings: dict) -> None:
                 f"<div class='depot-slide-header'>► LOADING BREAKDOWN — {depot_name}</div>",
                 unsafe_allow_html=True,
             )
-            # SKU table — hide zero-qty confect rows on TV to fit screen
+            # SKU table — hide zero-qty rows on TV to fit screen
             table_html = _build_depot_sku_table(
                 depot_name, truck_labels, truck_regs, depot_rows,
-                show_loaded=True, hide_zero_confect=True,
+                show_loaded=True, hide_zero_confect=True, hide_zero_bread=True,
             )
             st.markdown(table_html, unsafe_allow_html=True)
 
@@ -1824,8 +1826,7 @@ def render_tv_mode(orders: list[dict], settings: dict) -> None:
         # ── Last slide: Local routes ────────────────────────────────────
         else:
             st.markdown("### 🚐 Local Routes Board")
-            locals_non_empty = [o for o in locals_ if o.get("target_qty", 0) > 0 or o.get("loaded_qty", 0) > 0]
-            render_board_tab(locals_non_empty, hourly_rate, True, "Local")
+            render_board_tab(locals_, hourly_rate, True, "Local")
 
     # Slide indicator dots
     slide_labels = ["Overview"] + depot_names + ["Local Routes"]
