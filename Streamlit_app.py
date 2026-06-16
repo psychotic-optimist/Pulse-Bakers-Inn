@@ -267,6 +267,20 @@ def _status_badge(status: str) -> str:
     return f"<span class='badge {cls}'>{status}</span>"
 
 
+def _tv_truck_label(tl: str, status: str, etc_str: str) -> str:
+    """
+    Build the per-truck label shown in the TV depot slide's ETC banner.
+    - In Queue → just the truck label + status badge (no ETC yet)
+    - Loaded / Dispatched → truck label + status badge ("done")
+    - Loading (or any other in-progress status) → label + badge + ETC time
+    """
+    badge = _status_badge(status)
+    if status in (STATUS_IN_QUEUE, STATUS_LOADED, STATUS_DISPATCHED):
+        return f"{tl}: {badge}"
+    color = "#166534" if etc_str == "Done" else "#1e40af"
+    return f"{tl}: {badge} <span style='color:{color}'>ETC {etc_str}</span>"
+
+
 def _progress_bar_html(pct: float) -> str:
     color = "#22c55e" if pct >= 100 else ("#3b82f6" if pct >= 50 else "#f59e0b")
     return (
@@ -574,6 +588,51 @@ def _render_loading_session_tab(orders: list[dict]) -> None:
 
 DEPOT_LOADING_RATE = 24_000  # loaves per hour, per truck (fixed)
 
+# Truck-level statuses used for depot trucks on the bay (reuse route statuses)
+TRUCK_STATUSES = [STATUS_IN_QUEUE, STATUS_LOADING, STATUS_LOADED, STATUS_DISPATCHED]
+
+
+def _get_truck_status(depot_rows: list[dict], truck_label: str) -> str:
+    """
+    Derive the current status for a truck from its depot_orders rows.
+    Uses the first non-null status found (all rows for a truck share the same status).
+    Falls back to STATUS_IN_QUEUE.
+    """
+    for r in depot_rows:
+        if r.get("truck_label") == truck_label and r.get("status"):
+            return r["status"]
+    return STATUS_IN_QUEUE
+
+
+def _update_truck_status(dispatch_date: date, depot_name: str, truck_label: str, new_status: str) -> bool:
+    """
+    Update the status field for every depot_orders row belonging to a single
+    truck (all SKU rows for that truck share one status). Re-uses
+    upsert_depot_orders so no new depot_database function is required.
+    """
+    rows = depot_db.get_depot_orders_by_depot(dispatch_date, depot_name)
+    truck_rows = [r for r in rows if r.get("truck_label") == truck_label]
+    if not truck_rows:
+        return False
+
+    updated_rows = []
+    for r in truck_rows:
+        updated_rows.append({
+            "dispatch_date":      dispatch_date.isoformat(),
+            "depot_name":         depot_name,
+            "truck_label":        truck_label,
+            "truck_registration": r.get("truck_registration", ""),
+            "sku_name":           r["sku_name"],
+            "sku_group":          r["sku_group"],
+            "ordered_qty":        r.get("ordered_qty", 0),
+            "loaded_qty":         r.get("loaded_qty", 0),
+            "status":             new_status,
+        })
+
+    _, errors = depot_db.upsert_depot_orders(updated_rows)
+    return errors == 0
+
+
 # SKU display order — matches the screenshot exactly
 BREAD_SKUS_ORDER = [
     "SUPERIOR", "BROWN", "WHOLE GRAIN",
@@ -627,7 +686,6 @@ def _build_depot_sku_table(
     rows: list[dict],
     show_loaded: bool = False,
     hide_zero_confect: bool = False,
-    hide_zero_bread: bool = False,
 ) -> str:
     """
     Build the HTML SKU breakdown table exactly matching the screenshot.
@@ -635,7 +693,6 @@ def _build_depot_sku_table(
     truck_labels: ordered list of truck sub-route labels (e.g. ["HATCLIFF 1", "HATCLIFF 2"])
     truck_regs: {truck_label: registration}
     hide_zero_confect: if True (TV mode), skip confect rows where every truck has qty=0.
-    hide_zero_bread: if True (TV mode), skip bread rows where every truck has qty=0.
     """
     # Index rows by (sku_name, truck_label) → row dict
     idx: dict[tuple, dict] = {}
@@ -685,12 +742,6 @@ def _build_depot_sku_table(
     confect_skus = [s for s in sku_order if s not in bread_skus]
 
     for sku in bread_skus:
-        all_qtys = [
-            (idx.get((sku, tl)) or {}).get("ordered_qty", 0)
-            for tl in truck_labels
-        ]
-        if hide_zero_bread and all(q == 0 for q in all_qtys):
-            continue
         cells = f"<td class='sku-label'>{sku}</td>"
         for tl in truck_labels:
             r = idx.get((sku, tl))
@@ -1267,6 +1318,122 @@ def render_depot_entry_panel(dispatch_date: date) -> None:
             st.rerun()
 
 
+def _render_bay_summary_tab(orders: list[dict], dispatch_date: date) -> None:
+    """
+    Bay Summary tab — lets a supervisor set each depot truck's bay status
+    (In Queue / Loading / Loaded / Dispatched), and shows a combined
+    summary of every truck/route and its current status & progress.
+    This status feeds straight into the TV display.
+    """
+    depot_summaries = depot_db.get_depot_summary(dispatch_date)
+
+    # ── Section A: per-truck status controls ───────────────────────────
+    st.markdown("##### 🚦 Set Truck Status")
+    st.caption(
+        "Update each truck's status as it moves through the bay. "
+        "This drives the “In Queue / Loading / Loaded” labels on the TV."
+    )
+
+    if not depot_summaries:
+        st.info("No depot trucks planned for today. Use **Depot Loading Plan** to add some.")
+    else:
+        for summary in depot_summaries:
+            depot_name  = summary["depot_name"]
+            depot_rows  = summary.get("rows") or depot_db.get_depot_orders_by_depot(dispatch_date, depot_name)
+            truck_labels = summary["trucks"]
+
+            st.markdown(f"**{depot_name}**")
+            for tl in truck_labels:
+                truck_rows = [r for r in depot_rows if r.get("truck_label") == tl]
+                reg = next((r.get("truck_registration", "") for r in truck_rows if r.get("truck_registration")), "")
+                current_status = _get_truck_status(depot_rows, tl)
+
+                col_lbl, col_badge, col_select, col_btn = st.columns([2, 1.4, 1.6, 1])
+                with col_lbl:
+                    st.markdown(f"{tl}" + (f"  ·  {reg}" if reg else ""))
+                with col_badge:
+                    st.markdown(_status_badge(current_status), unsafe_allow_html=True)
+                with col_select:
+                    new_status = st.selectbox(
+                        "Status",
+                        TRUCK_STATUSES,
+                        index=TRUCK_STATUSES.index(current_status) if current_status in TRUCK_STATUSES else 0,
+                        key=f"bay_status_select_{depot_name}_{tl}",
+                        label_visibility="collapsed",
+                    )
+                with col_btn:
+                    if st.button("Update", key=f"bay_status_btn_{depot_name}_{tl}", use_container_width=True):
+                        if new_status == current_status:
+                            st.info("No change.")
+                        elif _update_truck_status(dispatch_date, depot_name, tl, new_status):
+                            st.success(f"{tl} → {new_status}")
+                            st.rerun()
+                        else:
+                            st.error("Failed to update status.")
+            st.markdown("")
+
+    st.markdown("---")
+
+    # ── Section B: combined summary table ──────────────────────────────
+    st.markdown("##### 📋 All Trucks &amp; Routes — Bay Summary")
+
+    summary_rows_html = ""
+
+    # Depot / freighter trucks
+    for summary in depot_summaries:
+        depot_name = summary["depot_name"]
+        depot_rows = summary.get("rows") or depot_db.get_depot_orders_by_depot(dispatch_date, depot_name)
+        for tl in summary["trucks"]:
+            truck_rows = [r for r in depot_rows if r.get("truck_label") == tl]
+            ordered = sum(r.get("ordered_qty", 0) for r in truck_rows)
+            loaded  = sum(r.get("loaded_qty", 0) for r in truck_rows)
+            reg = next((r.get("truck_registration", "") for r in truck_rows if r.get("truck_registration")), "")
+            status = _get_truck_status(depot_rows, tl)
+            pct = calculations.progress_pct(loaded, ordered)
+            summary_rows_html += (
+                "<tr>"
+                f"<td>{tl}</td>"
+                f"<td>{reg or '—'}</td>"
+                f"<td>{depot_name}</td>"
+                f"<td>{_status_badge(status)}</td>"
+                f"<td style='text-align:right'>{loaded:,} / {ordered:,} ({pct:.0f}%)</td>"
+                "</tr>"
+            )
+
+    # Local routes
+    for o in orders:
+        if o.get("route_type") != "Local":
+            continue
+        ordered = o.get("target_qty", 0)
+        loaded  = o.get("loaded_qty", 0)
+        pct = calculations.progress_pct(loaded, ordered)
+        summary_rows_html += (
+            "<tr>"
+            f"<td>{o.get('route_name','')}</td>"
+            f"<td>{o.get('truck_registration','') or '—'}</td>"
+            f"<td>Local</td>"
+            f"<td>{_status_badge(o.get('status', STATUS_IN_QUEUE))}</td>"
+            f"<td style='text-align:right'>{loaded:,} / {ordered:,} ({pct:.0f}%)</td>"
+            "</tr>"
+        )
+
+    if not summary_rows_html:
+        st.info("No trucks or routes to show today.")
+    else:
+        st.markdown(
+            "<table class='board-table'><thead><tr>"
+            "<th>BAY / ROUTE</th>"
+            "<th>REG</th>"
+            "<th>DEPOT / TYPE</th>"
+            "<th>STATUS</th>"
+            "<th style='text-align:right'>PROGRESS</th>"
+            "</tr></thead><tbody>"
+            + summary_rows_html
+            + "</tbody></table>",
+            unsafe_allow_html=True,
+        )
+
+
 def render_supervisor_controls(orders: list[dict], dispatch_date: date) -> None:
     if not auth.can_edit():
         return
@@ -1274,13 +1441,17 @@ def render_supervisor_controls(orders: list[dict], dispatch_date: date) -> None:
     st.markdown("---")
     st.subheader("Supervisor Controls")
 
-    tab_session, tab_update, tab_create, tab_settings = st.tabs(
-        ["Loading Session", "Update Order", "New Order", "Production Settings"]
+    tab_session, tab_bay, tab_update, tab_create, tab_settings = st.tabs(
+        ["Loading Session", "Bay Summary", "Update Order", "New Order", "Production Settings"]
     )
 
     # ── Loading Session ETC ───────────────────────────────────────────────
     with tab_session:
         _render_loading_session_tab(orders)
+
+    # ── Bay Summary ──────────────────────────────────────────────────────
+    with tab_bay:
+        _render_bay_summary_tab(orders, dispatch_date)
 
     # ── Update Order ─────────────────────────────────────────────────────
     with tab_update:
@@ -1762,16 +1933,19 @@ def render_tv_mode(orders: list[dict], settings: dict) -> None:
                 if r["truck_label"] not in truck_regs and r.get("truck_registration"):
                     truck_regs[r["truck_label"]] = r["truck_registration"]
 
-            # ETC per truck
+            # ETC + status per truck
             tv_now = calculations.get_local_now()
             truck_etcs: dict[str, str] = {}
+            truck_statuses: dict[str, str] = {}
             all_etcs = []
             for tl in truck_labels:
                 truck_rows = [r for r in depot_rows if r["truck_label"] == tl]
+                status = _get_truck_status(depot_rows, tl)
+                truck_statuses[tl] = status
                 remaining = sum(
                     max(0, r["ordered_qty"] - r["loaded_qty"]) for r in truck_rows
                 )
-                if remaining <= 0:
+                if remaining <= 0 or status in (STATUS_LOADED, STATUS_DISPATCHED):
                     truck_etcs[tl] = "Done"
                 else:
                     from datetime import timedelta
@@ -1796,10 +1970,10 @@ def render_tv_mode(orders: list[dict], settings: dict) -> None:
                 f"<div class='depot-slide-header'>► LOADING BREAKDOWN — {depot_name}</div>",
                 unsafe_allow_html=True,
             )
-            # SKU table — hide zero-qty rows on TV to fit screen
+            # SKU table — hide zero-qty confect rows on TV to fit screen
             table_html = _build_depot_sku_table(
                 depot_name, truck_labels, truck_regs, depot_rows,
-                show_loaded=True, hide_zero_confect=True, hide_zero_bread=True,
+                show_loaded=True, hide_zero_confect=True,
             )
             st.markdown(table_html, unsafe_allow_html=True)
 
@@ -1811,7 +1985,7 @@ def render_tv_mode(orders: list[dict], settings: dict) -> None:
                 f"font-size:1.1rem;font-weight:700;color:{banner_color}'>"
                 f"⏱ {route_etc_str} &nbsp;|&nbsp; "
                 + " &nbsp;|&nbsp; ".join(
-                    f"{tl}: <span style='color:{('#166534' if truck_etcs[tl]=='Done' else '#1e40af')}'>{truck_etcs[tl]}</span>"
+                    _tv_truck_label(tl, truck_statuses[tl], truck_etcs[tl])
                     for tl in truck_labels
                 )
                 + "</div>",
