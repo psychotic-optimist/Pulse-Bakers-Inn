@@ -35,6 +35,10 @@ from config import (
     STATUS_AWAITING,
     TV_DISPLAY_PARAM,
 )
+try:
+    from config import MOBILE_DISPLAY_PARAM
+except ImportError:
+    MOBILE_DISPLAY_PARAM = "mobile"  # fallback: ?mobile=true
 from importer import parse_all_sheets
 
 # Baker's Inn logo (base64 embedded)
@@ -50,6 +54,50 @@ logger = logging.getLogger(__name__)
 def _is_tv_mode() -> bool:
     params = st.query_params
     return params.get(TV_DISPLAY_PARAM, "").lower() in ("true", "1", "yes")
+
+
+def _is_mobile_mode() -> bool:
+    """
+    Mobile Mode is active if:
+      1) the URL has ?mobile=true / 1 / yes (manual override — always wins), OR
+      2) the URL has ?mobile=false / 0 / no (manual override — forces OFF), OR
+      3) auto-detect: a tiny JS snippet measures window width and, if narrow,
+         sets ?mobile=true and reruns. See _inject_mobile_autodetect().
+    """
+    params = st.query_params
+    raw = params.get(MOBILE_DISPLAY_PARAM, "").lower()
+    if raw in ("true", "1", "yes"):
+        return True
+    if raw in ("false", "0", "no"):
+        return False
+    return False  # default until auto-detect JS sets the param
+
+
+def _inject_mobile_autodetect() -> None:
+    """
+    Runs once per page load. If the viewport is narrow (<= 820px, i.e. phone
+    or small tablet) and the URL doesn't already carry a `mobile` param,
+    silently add ?mobile=true and reload — switching the app into Mobile Mode
+    automatically. Desktop/TV screens are untouched.
+    """
+    st.markdown(
+        f"""
+        <script>
+        (function() {{
+            try {{
+                const url = new URL(window.parent.location.href);
+                const hasParam = url.searchParams.has("{MOBILE_DISPLAY_PARAM}");
+                const isNarrow = window.parent.innerWidth <= 820;
+                if (!hasParam && isNarrow) {{
+                    url.searchParams.set("{MOBILE_DISPLAY_PARAM}", "true");
+                    window.parent.location.replace(url.toString());
+                }}
+            }} catch (e) {{ /* cross-origin safety net, no-op */ }}
+        }})();
+        </script>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 st.set_page_config(
@@ -226,6 +274,52 @@ def _inject_css(tv_mode: bool) -> None:
         @media (max-width: 768px) {{
             .kpi-value {{ font-size: 1.4em; }}
             .board-table {{ font-size: 0.78rem; }}
+        }}
+
+        /* ── Mobile Mode (dedicated card UI) ── */
+        .mc-header {{
+            background: linear-gradient(135deg, #1B2D6B 0%, #2a4298 100%);
+            border-radius: 10px;
+            padding: 0.7rem 1rem;
+            margin-bottom: 0.9rem;
+            display: flex;
+            align-items: center;
+            gap: 0.7rem;
+        }}
+        .mc-header img {{ height: 36px; width: auto; }}
+        .mc-header-title {{ color: #fff; font-size: 1.05rem; font-weight: 800; margin: 0; line-height: 1.2; }}
+        .mc-header-sub {{ color: #C9A84C; font-size: 0.7rem; margin: 2px 0 0 0; font-weight: 600; }}
+
+        .mc-card {{
+            background: #ffffff;
+            border: 1px solid #e5e7eb;
+            border-left: 5px solid #C9A84C;
+            border-radius: 10px;
+            padding: 0.85rem 1rem;
+            margin-bottom: 0.7rem;
+            box-shadow: 0 1px 4px rgba(27,45,107,.06);
+        }}
+        .mc-card-title {{ font-size: 1.05rem; font-weight: 800; color: #1B2D6B; margin: 0 0 2px 0; }}
+        .mc-card-sub {{ font-size: 0.78rem; color: #6b7280; margin: 0 0 8px 0; }}
+        .mc-card-row {{
+            display: flex; justify-content: space-between; align-items: center;
+            font-size: 0.85rem; padding: 3px 0;
+        }}
+        .mc-card-row b {{ color: #1B2D6B; }}
+
+        /* Full-width, taller tap targets on mobile */
+        .mc-touch div.stButton > button,
+        .mc-touch div.stSelectbox,
+        .mc-touch div.stNumberInput input {{
+            min-height: 44px;
+            font-size: 1rem !important;
+        }}
+        .mc-touch div.stButton > button {{ width: 100%; padding: 0.6rem 0; }}
+
+        .mc-section-label {{
+            font-size: 0.72rem; font-weight: 800; color: #1B2D6B;
+            text-transform: uppercase; letter-spacing: 0.8px;
+            margin: 1rem 0 0.4rem 0;
         }}
         </style>
         """,
@@ -2027,12 +2121,273 @@ def render_tv_mode(orders: list[dict], settings: dict) -> None:
 
 
 # ===========================================================================
+# Mobile Mode — dedicated card-based UI for phones / small tablets
+# ===========================================================================
+
+def _mc_header(today_str: str) -> None:
+    st.markdown(
+        f"""
+        <div class='mc-header'>
+            <img src='{_LOGO_B64}' alt="Baker's Inn" />
+            <div>
+                <p class='mc-header-title'>Dispatch — Mobile</p>
+                <p class='mc-header-sub'>{today_str}</p>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_mobile_bay_status(orders: list[dict], dispatch_date: date) -> None:
+    """
+    Mobile version of the Bay Summary tab: one stacked card per truck/route
+    with a status badge, progress line, and a status selector + Update
+    button sized for touch. No multi-column grids.
+    """
+    depot_summaries = depot_db.get_depot_summary(dispatch_date)
+    locals_ = [o for o in orders if o.get("route_type") == "Local"]
+
+    if not depot_summaries and not locals_:
+        st.info("No trucks or routes for today.")
+        return
+
+    st.markdown("<div class='mc-touch'>", unsafe_allow_html=True)
+
+    # ── Depot / freighter trucks ────────────────────────────────────────
+    for summary in depot_summaries:
+        depot_name = summary["depot_name"]
+        depot_rows = summary.get("rows") or depot_db.get_depot_orders_by_depot(dispatch_date, depot_name)
+        truck_labels = summary["trucks"]
+
+        st.markdown(f"<div class='mc-section-label'>{depot_name}</div>", unsafe_allow_html=True)
+
+        for tl in truck_labels:
+            truck_rows = [r for r in depot_rows if r.get("truck_label") == tl]
+            ordered = sum(r.get("ordered_qty", 0) for r in truck_rows)
+            loaded  = sum(r.get("loaded_qty", 0) for r in truck_rows)
+            reg = next((r.get("truck_registration", "") for r in truck_rows if r.get("truck_registration")), "")
+            current_status = _get_truck_status(depot_rows, tl)
+            pct = calculations.progress_pct(loaded, ordered)
+
+            st.markdown(
+                f"""
+                <div class='mc-card'>
+                    <p class='mc-card-title'>{tl}</p>
+                    <p class='mc-card-sub'>{reg or '—'}</p>
+                    <div class='mc-card-row'><span>Status</span>{_status_badge(current_status)}</div>
+                    <div class='mc-card-row'><span>Progress</span><b>{loaded:,} / {ordered:,} ({pct:.0f}%)</b></div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            new_status = st.selectbox(
+                f"Status — {tl}",
+                TRUCK_STATUSES,
+                index=TRUCK_STATUSES.index(current_status) if current_status in TRUCK_STATUSES else 0,
+                key=f"m_bay_status_{depot_name}_{tl}",
+            )
+            if st.button(f"Update {tl}", key=f"m_bay_btn_{depot_name}_{tl}"):
+                if new_status == current_status:
+                    st.info("No change.")
+                elif _update_truck_status(dispatch_date, depot_name, tl, new_status):
+                    st.success(f"{tl} → {new_status}")
+                    st.rerun()
+                else:
+                    st.error("Failed to update status.")
+
+    # ── Local routes ─────────────────────────────────────────────────────
+    if locals_:
+        st.markdown("<div class='mc-section-label'>Local Routes</div>", unsafe_allow_html=True)
+        for o in locals_:
+            ordered = o.get("target_qty", 0)
+            loaded  = o.get("loaded_qty", 0)
+            pct = calculations.progress_pct(loaded, ordered)
+            status = o.get("status", STATUS_IN_QUEUE)
+
+            st.markdown(
+                f"""
+                <div class='mc-card'>
+                    <p class='mc-card-title'>{o.get('route_name','')}</p>
+                    <p class='mc-card-sub'>{o.get('driver_name','') or '—'} · {o.get('truck_registration','') or '—'}</p>
+                    <div class='mc-card-row'><span>Status</span>{_status_badge(status)}</div>
+                    <div class='mc-card-row'><span>Progress</span><b>{loaded:,} / {ordered:,} ({pct:.0f}%)</b></div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            new_loaded = st.number_input(
+                f"Loaded qty — {o.get('route_name','')}",
+                min_value=0,
+                max_value=max(ordered * 2, 100),
+                value=loaded,
+                step=50,
+                key=f"m_local_qty_{o['id']}",
+            )
+            all_opts = ALL_STATUSES
+            current_idx = all_opts.index(status) if status in all_opts else 0
+            new_status = st.selectbox(
+                f"Status — {o.get('route_name','')}",
+                all_opts,
+                index=current_idx,
+                key=f"m_local_status_{o['id']}",
+            )
+            if st.button(f"Save {o.get('route_name','')}", key=f"m_local_btn_{o['id']}"):
+                changed = False
+                if new_loaded != loaded:
+                    if db.update_loaded_qty(o["id"], new_loaded, auth.current_user()):
+                        changed = True
+                    else:
+                        st.error("Failed to update loaded qty.")
+                auto_status = calculations.derive_status(new_loaded, ordered)
+                if new_status != auto_status and new_status != status:
+                    if db.update_status(o["id"], new_status, auth.current_user()):
+                        changed = True
+                    else:
+                        st.error("Failed to update status.")
+                if changed:
+                    st.success("Saved.")
+                    st.rerun()
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def _render_mobile_depot_entry(dispatch_date: date) -> None:
+    """
+    Mobile version of depot SKU entry: one truck at a time (selected via a
+    dropdown), each SKU as a stacked row with a number input — instead of
+    the wide truck-by-truck grid used on desktop.
+    """
+    depot_summaries = depot_db.get_depot_summary(dispatch_date)
+    if not depot_summaries:
+        st.info("No depot trucks planned for today yet.")
+        return
+
+    depot_names = [s["depot_name"] for s in depot_summaries]
+    sel_depot = st.selectbox("Depot", depot_names, key="m_depot_sel")
+    summary = next(s for s in depot_summaries if s["depot_name"] == sel_depot)
+    depot_rows = summary.get("rows") or depot_db.get_depot_orders_by_depot(dispatch_date, sel_depot)
+    truck_labels = summary["trucks"]
+
+    sel_truck = st.selectbox("Truck", truck_labels, key="m_truck_sel")
+    truck_rows = [r for r in depot_rows if r.get("truck_label") == sel_truck]
+    reg = next((r.get("truck_registration", "") for r in truck_rows if r.get("truck_registration")), "")
+    if reg:
+        st.caption(f"Reg: {reg}")
+
+    st.markdown("<div class='mc-touch'>", unsafe_allow_html=True)
+    edited_qtys: dict[str, int] = {}
+    for r in sorted(truck_rows, key=lambda x: x["sku_name"]):
+        sku = r["sku_name"]
+        col_label, col_input = st.columns([2, 1])
+        with col_label:
+            st.markdown(f"**{sku}**  \n<small>Loaded: {r.get('loaded_qty', 0):,}</small>", unsafe_allow_html=True)
+        with col_input:
+            edited_qtys[sku] = st.number_input(
+                sku, min_value=0, value=int(r.get("ordered_qty", 0)), step=10,
+                key=f"m_depot_qty_{sel_depot}_{sel_truck}_{sku}",
+                label_visibility="collapsed",
+            )
+
+    if st.button("Save Truck Quantities", key=f"m_depot_save_{sel_depot}_{sel_truck}"):
+        updated_rows = []
+        for r in truck_rows:
+            sku = r["sku_name"]
+            updated_rows.append({
+                "dispatch_date":      dispatch_date.isoformat(),
+                "depot_name":         sel_depot,
+                "truck_label":        sel_truck,
+                "truck_registration": r.get("truck_registration", ""),
+                "sku_name":           sku,
+                "sku_group":          r["sku_group"],
+                "ordered_qty":        edited_qtys.get(sku, r.get("ordered_qty", 0)),
+                "loaded_qty":         r.get("loaded_qty", 0),
+                "status":             r.get("status") or STATUS_IN_QUEUE,
+            })
+        _, errors = depot_db.upsert_depot_orders(updated_rows)
+        if errors == 0:
+            st.success(f"{sel_truck} quantities saved.")
+            st.rerun()
+        else:
+            st.error("Some rows failed to save.")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_mobile_mode(today: date, settings: dict, hourly_rate: int) -> None:
+    """
+    Entry point for Mobile Mode. Triggered automatically on narrow screens,
+    or manually via ?mobile=true. Provides full functionality (status
+    updates, qty entry) using stacked cards instead of multi-column grids,
+    sized for touch.
+    """
+    orders = db.get_orders_for_date(today)
+
+    _mc_header(today.strftime("%a, %d %b %Y"))
+
+    # Lightweight top nav (a sidebar is awkward to reach on a phone)
+    view = st.radio(
+        "View",
+        ["Overview", "Bay Status", "Depot Entry"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+
+    st.markdown("---")
+
+    if view == "Overview":
+        # Stacked KPIs (no st.columns — they'd be squashed on a phone)
+        buffer = settings.get("current_bin_level", 0)
+        total_demand = calculations.kpi_total_demand(orders)
+        total_remaining = calculations.kpi_total_remaining(orders)
+        overall_pct = calculations.kpi_overall_progress(orders)
+        finish_dt = calculations.kpi_estimated_finish(orders, hourly_rate, buffer)
+        finish_str = calculations.format_etc(finish_dt) if finish_dt else "Done"
+
+        for label, value, delta in [
+            ("Opening Stock", f"{buffer:,}", "loaves in bin"),
+            ("Hourly Rate", f"{hourly_rate:,}", "loaves/hour"),
+            ("Total Demand", f"{total_demand:,}", "loaves today"),
+            ("Remaining", f"{total_remaining:,}", f"{overall_pct:.0f}% loaded"),
+            ("Est. Finish", finish_str, "all routes done"),
+        ]:
+            st.markdown(_kpi_card(label, value, delta), unsafe_allow_html=True)
+
+        st.markdown("<div class='mc-section-label'>Quick Status</div>", unsafe_allow_html=True)
+        depot_summaries = depot_db.get_depot_summary(today)
+        n_trucks = sum(len(s["trucks"]) for s in depot_summaries)
+        n_locals = len([o for o in orders if o.get("route_type") == "Local"])
+        st.markdown(
+            f"<div class='mc-card'>"
+            f"<div class='mc-card-row'><span>Depot trucks today</span><b>{n_trucks}</b></div>"
+            f"<div class='mc-card-row'><span>Local routes today</span><b>{n_locals}</b></div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+        st.caption("Switch to **Bay Status** to update truck progress, or **Depot Entry** to enter SKU quantities.")
+
+    elif view == "Bay Status":
+        _render_mobile_bay_status(orders, today)
+
+    else:  # Depot Entry
+        _render_mobile_depot_entry(today)
+
+    st.markdown("---")
+    if st.button("Sign Out", key="m_signout", use_container_width=True):
+        auth.logout()
+        st.rerun()
+    st.caption(f"{auth.current_user()} · {auth.current_role()} · refreshes every 30s")
+
+
+# ===========================================================================
 # Main
 # ===========================================================================
 
 def main() -> None:
     tv_mode = _is_tv_mode()
+    mobile_mode = _is_mobile_mode()
     _inject_css(tv_mode)
+    if not tv_mode:
+        _inject_mobile_autodetect()
 
     # ── Authentication ──────────────────────────────────────────────────
     auth.require_auth()
@@ -2050,6 +2405,10 @@ def main() -> None:
     if tv_mode:
         orders = db.get_orders_for_date(today)
         render_tv_mode(orders, settings)
+        return
+
+    if mobile_mode:
+        render_mobile_mode(today, settings, hourly_rate)
         return
 
     # ── Sidebar ──────────────────────────────────────────────────────────
@@ -2084,7 +2443,9 @@ def main() -> None:
 
         st.markdown("---")
         st.markdown(
-            "<small style='color:#9ca3af'>TV mode: add <code>?display=true</code> to URL</small>",
+            "<small style='color:#9ca3af'>TV mode: add <code>?display=true</code> to URL</small>"
+            "<br><small style='color:#9ca3af'>Mobile mode: add <code>?mobile=true</code> to URL "
+            "(auto-detected on narrow screens, or force with <code>?mobile=false</code>)</small>",
             unsafe_allow_html=True,
         )
 
